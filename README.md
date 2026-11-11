@@ -10,36 +10,45 @@ S3 (CSV) → AWS Glue (PySpark ETL) → S3 (Parquet) → Athena (SQL)
 
 ## Architecture
 
+```mermaid
+flowchart LR
+    subgraph Input
+        S3Raw["☁️ S3 Raw\n(CSV)"]
+    end
+
+    subgraph Processing
+        Glue["⚙️ AWS Glue\n(PySpark ETL)"]
+        Catalog["📚 Glue Data\nCatalog"]
+    end
+
+    subgraph Output
+        S3Parquet["☁️ S3 Processed\n(Parquet + Snappy)"]
+        Athena["🔍 Athena\n(SQL Analytics)"]
+    end
+
+    subgraph Rejected
+        S3Rejected["⚠️ S3 Rejected\n(JSON)"]
+    end
+
+    S3Raw -->|"read CSV"| Glue
+    Glue -->|"validate + enrich"| S3Parquet
+    Glue -->|"update schema"| Catalog
+    Glue -->|"bad records"| S3Rejected
+    S3Parquet --> Athena
+    Catalog -.->|"table metadata"| Athena
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Serverless Data Pipeline                      │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────┐    ┌──────────────┐    ┌──────────┐    ┌────────┐ │
-│  │  S3 Raw  │───▶│  AWS Glue    │───▶│S3 Parquet│───▶│ Athena │ │
-│  │  (CSV)   │    │  (PySpark)   │    │(Snappy)  │    │ (SQL)  │ │
-│  └──────────┘    └──────┬───────┘    └──────────┘    └────────┘ │
-│                         │                                        │
-│                         ▼                                        │
-│                  ┌──────────────┐                                │
-│                  │   Glue Data  │                                │
-│                  │   Catalog    │                                │
-│                  └──────────────┘                                │
-│                                                                  │
-│  Data Quality:                                                   │
-│  ├── Null/empty ID detection                                     │
-│  ├── Negative amount filtering                                   │
-│  ├── Invalid status rejection                                    │
-│  ├── Future date detection                                       │
-│  └── Rejected records → S3 (JSON) for review                    │
-│                                                                  │
-│  Enrichment:                                                     │
-│  ├── Temporal: year, month, day_of_week, hour                    │
-│  ├── Business: amount_bucket, is_weekend                         │
-│  └── Audit: processing_timestamp                                 │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+
+### Data Quality Checks
+- Null/empty transaction ID detection
+- Negative amount filtering
+- Invalid status rejection
+- Future date detection
+- Rejected records → S3 (JSON) for review
+
+### Enrichment
+- **Temporal**: `year`, `month`, `day_of_week`, `hour` (partition keys)
+- **Business**: `amount_bucket` (micro/small/medium/large/enterprise), `is_weekend`
+- **Audit**: `processing_timestamp`
 
 ## Performance & Cost
 
@@ -144,10 +153,14 @@ serverless-data-pipeline/
 
 ### Data Flow
 
-```
-Raw CSV → Read → Validate → Enrich → Write Parquet → Update Catalog
-                    │
-                    └─→ Write Rejected (JSON)
+```mermaid
+flowchart LR
+    A["📄 Raw CSV"] --> B["Read"]
+    B --> C{"Validate"}
+    C -->|"✅ valid"| D["Enrich"]
+    D --> E["Write Parquet"]
+    E --> F["Update Catalog"]
+    C -->|"❌ invalid"| G["Write Rejected\n(JSON)"]
 ```
 
 ### Validation Rules

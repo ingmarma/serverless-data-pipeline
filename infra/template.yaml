@@ -1,0 +1,356 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Serverless Data Pipeline - CSV to Parquet with Glue + Athena
+  Author: @ingmarma | MarmaTech
+  Cost: ~$0.47 per 100GB processed
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: serverless-data-pipeline
+    Description: Project name used for resource naming
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  GlueWorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.1X, G.2X]
+    Description: Glue worker type (G.1X = 4 vCPU/16GB, G.2X = 8 vCPU/32GB)
+
+  GlueNumberOfWorkers:
+    Type: Number
+    Default: 5
+    MinValue: 2
+    MaxValue: 100
+    Description: Number of Glue workers for ETL job
+
+Resources:
+
+  # ============================================================
+  # S3 BUCKETS
+  # ============================================================
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-raw-${AWS::AccountId}-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-${AWS::AccountId}-${Environment}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-scripts-${AWS::AccountId}-${Environment}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ============================================================
+  # IAM ROLES
+  # ============================================================
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-glue-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawDataBucket.Arn
+                  - !Sub '${RawDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ProcessedDataBucket.Arn
+                  - !Sub '${ProcessedDataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt ScriptsBucket.Arn
+                  - !Sub '${ScriptsBucket.Arn}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: 'arn:aws:logs:*:*:*'
+
+  # ============================================================
+  # GLUE DATABASE & CRAWLER
+  # ============================================================
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${ProjectName}_${Environment}'
+        Description: !Sub 'Data catalog for ${ProjectName} pipeline'
+
+  RawDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-raw-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${RawDataBucket}/input/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+      Configuration: >
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": { "AddOrUpdateBehavior": "InheritFromTable" }
+          }
+        }
+
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ProjectName}-processed-crawler-${Environment}'
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${ProcessedDataBucket}/output/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ============================================================
+  # GLUE ETL JOB
+  # ============================================================
+
+  ETLJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${ProjectName}-etl-${Environment}'
+      Description: 'Transform CSV to Parquet with data quality checks'
+      Role: !GetAtt GlueServiceRole.Arn
+      GlueVersion: '4.0'
+      WorkerType: !Ref GlueWorkerType
+      NumberOfWorkers: !Ref GlueNumberOfWorkers
+      Timeout: 60
+      MaxRetries: 1
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub 's3://${ScriptsBucket}/glue/etl_job.py'
+        PythonVersion: '3'
+      DefaultArguments:
+        '--job-language': python
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-spark-ui': 'true'
+        '--spark-event-logs-path': !Sub 's3://${ProcessedDataBucket}/spark-logs/'
+        '--RAW_BUCKET': !Ref RawDataBucket
+        '--PROCESSED_BUCKET': !Ref ProcessedDataBucket
+        '--DATABASE_NAME': !Ref GlueDatabase
+        '--TABLE_NAME': 'transactions'
+        '--PARTITION_KEYS': 'year,month'
+        '--additional-python-modules': 'great_expectations==0.18.8'
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ============================================================
+  # ATHENA WORKGROUP
+  # ============================================================
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}'
+      Description: !Sub 'Workgroup for ${ProjectName} queries'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${ProcessedDataBucket}/athena-results/'
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 10737418240  # 10 GB limit
+        EngineVersion:
+          SelectedEngineVersion: 'Athena engine version 3'
+
+  # ============================================================
+  # ATHENA NAMED QUERIES
+  # ============================================================
+
+  QueryTotalByMonth:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabase
+      Name: total_amount_by_month
+      Description: 'Monthly transaction totals'
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: |
+        SELECT
+          year,
+          month,
+          COUNT(*) as transaction_count,
+          ROUND(SUM(amount), 2) as total_amount,
+          ROUND(AVG(amount), 2) as avg_amount,
+          ROUND(MIN(amount), 2) as min_amount,
+          ROUND(MAX(amount), 2) as max_amount
+        FROM transactions
+        GROUP BY year, month
+        ORDER BY year, month;
+
+  QueryTopCategories:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabase
+      Name: top_categories
+      Description: 'Top 10 categories by revenue'
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: |
+        SELECT
+          category,
+          COUNT(*) as transaction_count,
+          ROUND(SUM(amount), 2) as total_revenue,
+          ROUND(AVG(amount), 2) as avg_ticket
+        FROM transactions
+        WHERE status = 'completed'
+        GROUP BY category
+        ORDER BY total_revenue DESC
+        LIMIT 10;
+
+  QueryDailyTrend:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref GlueDatabase
+      Name: daily_trend
+      Description: 'Daily transaction trend with rolling average'
+      WorkGroup: !Ref AthenaWorkgroup
+      QueryString: |
+        WITH daily AS (
+          SELECT
+            DATE(transaction_date) as tx_date,
+            COUNT(*) as tx_count,
+            ROUND(SUM(amount), 2) as daily_total
+          FROM transactions
+          WHERE status = 'completed'
+          GROUP BY DATE(transaction_date)
+        )
+        SELECT
+          tx_date,
+          tx_count,
+          daily_total,
+          ROUND(AVG(daily_total) OVER (
+            ORDER BY tx_date
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+          ), 2) as rolling_7d_avg
+        FROM daily
+        ORDER BY tx_date;
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+Outputs:
+  RawBucketName:
+    Description: S3 bucket for raw CSV data
+    Value: !Ref RawDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-raw-bucket-${Environment}'
+
+  ProcessedBucketName:
+    Description: S3 bucket for processed Parquet data
+    Value: !Ref ProcessedDataBucket
+    Export:
+      Name: !Sub '${ProjectName}-processed-bucket-${Environment}'
+
+  ScriptsBucketName:
+    Description: S3 bucket for Glue scripts
+    Value: !Ref ScriptsBucket
+
+  GlueDatabaseName:
+    Description: Glue Data Catalog database
+    Value: !Ref GlueDatabase
+
+  ETLJobName:
+    Description: Glue ETL job name
+    Value: !Ref ETLJob
+
+  AthenaWorkgroupName:
+    Description: Athena workgroup
+    Value: !Ref AthenaWorkgroup
+
+  GlueRoleArn:
+    Description: IAM role ARN for Glue
+    Value: !GetAtt GlueServiceRole.Arn

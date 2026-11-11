@@ -304,4 +304,4 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-Built by [@ingmarma](https://github.com/ingmarma) | [MarmaTech](https://instagram.com/marmatech.dev)
+Built by [@ingmarma](https://github.com/ingmarma) |[ingmarma](www.linkedin.com/in/ingmarma) | [MarmaTech](https://instagram.com/marmatech.dev)
